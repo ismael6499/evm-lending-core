@@ -1,621 +1,544 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.24;
 
-import {MockToken} from "./MockToken.sol";
 import {IERC20} from "../lib/openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "../lib/openzeppelin-contracts/contracts/token/ERC20/utils/SafeERC20.sol";
 import {ReentrancyGuard} from "../lib/openzeppelin-contracts/contracts/utils/ReentrancyGuard.sol";
 import {Pausable} from "../lib/openzeppelin-contracts/contracts/utils/Pausable.sol";
-import {Ownable} from "../lib/openzeppelin-contracts/contracts/access/Ownable.sol";
+import {AccessControl} from "../lib/openzeppelin-contracts/contracts/access/AccessControl.sol";
 import {ECDSA} from "../lib/openzeppelin-contracts/contracts/utils/cryptography/ECDSA.sol";
 import {MessageHashUtils} from "../lib/openzeppelin-contracts/contracts/utils/cryptography/MessageHashUtils.sol";
+import {IOracle} from "./interfaces/IOracle.sol";
+import {IWETH} from "./interfaces/IWETH.sol";
 
 /**
- * @title Advanced Lending & Borrowing Protocol
+ * @title LendingProtocol V3 (Institutional Grade)
  * @author Agustin Acosta
- * @notice This contract implements the core logic for a decentralized lending and borrowing platform, 
- * focusing on collateralized debt positions and interest rate dynamics.
- * @dev Inherits from OpenZeppelin standards to ensure security through ReentrancyGuard, Pausable, and Ownable models.
- * Uses SafeERC20 for robust token interactions and ECDSA for cryptographic verification.
+ * @notice An enterprise-grade, decentralised lending and borrowing protocol with advanced risk management.
+ * @dev Implements RBAC (AccessControl), Pausability, Kinked Interest Rate Models, and segmented Risk Thresholds.
+ * Uses a two-slope utilization curve to manage liquidity pressure and provides a safety buffer via a 
+ * separate Liquidation Threshold.
  */
-contract LendingProtocol is ReentrancyGuard, Pausable, Ownable {
+contract LendingProtocol is ReentrancyGuard, Pausable, AccessControl {
     using SafeERC20 for IERC20;
-    using ECDSA for bytes32;
-    using MessageHashUtils for bytes32;
+    using ECDSA for bytes;
 
-    // Events
+    // ============ CONSTANTS & ROLES ============
+
     /**
-     * @notice Emitted when a new market is added to the protocol.
-     * @param token The address of the token being added as a market.
-     * @param collateralFactor The collateral factor assigned to the token (expressed in basis points or fixed-point).
+     * @notice Global identifier for market management authorities.
      */
-    event MarketAdded(address indexed token, uint256 collateralFactor);
+    bytes32 public constant MARKET_MANAGER_ROLE = keccak256("MARKET_MANAGER_ROLE");
 
     /**
-     * @notice Emitted when an existing market's parameters are updated.
-     * @param token The address of the token being updated.
-     * @param collateralFactor The new collateral factor assigned to the token.
+     * @notice Global identifier for emergency stopping authorities.
      */
-    event MarketUpdated(address indexed token, uint256 collateralFactor);
+    bytes32 public constant PAUSER_ROLE = keccak256("PAUSER_ROLE");
 
     /**
-     * @notice Emitted when a user deposits tokens into a market.
-     * @param user The address of the user making the deposit.
-     * @param token The address of the token being deposited.
-     * @param amount The amount of tokens deposited.
+     * @notice Role for asset recovery and protocol protection.
      */
-    event Deposit(address indexed user, address indexed token, uint256 amount);
+    bytes32 public constant EMERGENCY_ROLE = keccak256("EMERGENCY_ROLE");
 
     /**
-     * @notice Emitted when a user withdraws tokens from a market.
-     * @param user The address of the user making the withdrawal.
-     * @param token The address of the token being withdrawn.
-     * @param amount The amount of tokens withdrawn.
+     * @notice Common denominator for percentage-based calculations.
      */
-    event Withdraw(address indexed user, address indexed token, uint256 amount);
+    uint256 public constant BASIS_POINTS = 10000;
 
     /**
-     * @notice Emitted when a user borrows tokens from a market.
-     * @param user The address of the user taking the loan.
-     * @param token The address of the token being borrowed.
-     * @param amount The amount of tokens borrowed.
+     * @notice Reward paid to liquidators over the debt repayment.
      */
-    event Borrow(address indexed user, address indexed token, uint256 amount);
+    uint256 public constant LIQUIDATION_PENALTY = 500;
 
     /**
-     * @notice Emitted when a user repays a debt.
-     * @param user The address of the user repaying the debt.
-     * @param token The address of the token being repaid.
-     * @param amount The amount of tokens repaid.
+     * @notice Protocol cut from the accrued interest.
      */
-    event Repay(address indexed user, address indexed token, uint256 amount);
+    uint256 public constant RESERVE_FACTOR = 1000;
 
     /**
-     * @notice Emitted when a user's position is liquidated.
-     * @param liquidator The address of the liquidator.
-     * @param user The address of the user being liquidated.
-     * @param token The address of the token involved in the liquidation.
-     * @param amount The amount of tokens liquidated.
+     * @notice Hard cap on the number of concurrently supported asset markets.
      */
-    event Liquidate(address indexed liquidator, address indexed user, address indexed token, uint256 amount);
+    uint256 public constant MAX_MARKETS = 20;
+
+    // ============ DATA STRUCTURES ============
 
     /**
-     * @notice Emitted when interest rates for a market are updated.
-     * @param token The address of the token whose rates were updated.
-     * @param supplyRate The new supply interest rate.
-     * @param borrowRate The new borrow interest rate.
-     */
-    event RatesUpdated(address indexed token, uint256 supplyRate, uint256 borrowRate);
-
-    modifier onlyActiveMarket(address token){
-        if(!markets[token].isActive) revert MarketNotActive();
-        _;
-    }
-
-    /**
-     * @notice Validates the signature's expiration and nonce.
-     * @param _sigData The signature metadata (nonce, deadline).
-     */
-    modifier onlyValidSignature(SignatureData calldata _sigData) {
-        if(_sigData.deadline < block.timestamp) revert SignatureExpired();
-        if(_sigData.nonce != userNonces[msg.sender]) revert InvalidNonce();
-        _;
-        userNonces[msg.sender]++;
-    }
-
-    /// @notice Raised when an operation is attempted with an amount of zero.
-    error InvalidAmount();
-    /// @notice Raised when a liquidator attempts to repay more than the user's current borrow balance.
-    error InsufficientBorrowToLiquidate();
-    /// @notice Raised when a liquidation is attempted on a healthy position (ratio >= threshold).
-    error PositionNotLiquidatable();
-    /// @notice Raised when no suitable collateral token can be found for the user.
-    error NoCollateralToSeize();
-    /// @notice Raised when the borrower doesn't have enough collateral in the selected token.
-    error InsufficientCollateral();
-    /// @notice Raised when a signature has passed its deadline.
-    error SignatureExpired();
-    /// @notice Raised when a signature uses an incorrect or already used nonce.
-    error InvalidNonce();
-    /// @notice Raised when the cryptographic signature recovery does not match the expected signer.
-    error InvalidSignature();
-    /// @notice Raised when trying to interact with a market that is not active.
-    error MarketNotActive();
-    /// @notice Raised when the token address provided is zero address.
-    error InvalidTokenAddress();
-    /// @notice Raised when the collateral factor is out of bounds (0 or > BASIS_POINTS).
-    error InvalidCollateralFactor();
-    /// @notice Raised when attempting to add a token that is already a valid market.
-    error MarketAlreadyExists();
-    /// @notice Raised when a user tries to withdraw more than their deposited balance.
-    error InsufficientDepositBalance();
-    /// @notice Raised when an action would leave the user's health factor below the liquidation threshold.
-    error UnsafePosition();
-    /// @notice Raised when the market doesn't have enough tokens to fulfill a borrow.
-    error InsufficientTotalSupply();
-    /// @notice Raised when trying to repay more than the owed debt.
-    error InsufficientBorrowBalance();
-    /// @notice Raised when the recipient address for emergency recovery is zero address.
-    error InvalidRecipient();
-
-    /**
-     * @notice Represents the protocol state for an individual user.
-     * @dev State variables are tracked to calculate interest and health factor.
-     */
-    struct User {
-        uint256 totalDeposited;
-        uint256 totalBorrowed;
-        uint256 lastUpdateTime;
-        bool isActive;
-    }
-
-    /**
-     * @notice Represents the configuration and state of a specific asset market.
-     * @dev Contains parameters for interest rates and risk management (collateral factor).
+     * @title Market Parameters
+     * @notice Encapsulates asset-specific risk and interest configurations.
      */
     struct Market {
         IERC20 token;
-        uint256 totalSupply;
-        uint256 totalBorrow;
-        uint256 supplyRate;
-        uint256 borrowRate;
-        uint256 collateralFactor;
         bool isActive;
+        uint256 collateralFactor;      // Maximum LTV in basis points.
+        uint256 liquidationThreshold;  // Debt-to-Collateral point for liquidations.
+        uint256 totalSupply;           // Cumulative supplied asset amount.
+        uint256 totalBorrow;           // Cumulative debt balance in this market.
+        uint256 lastAccrualTime;       // Block timestamp of the last interest event.
+        uint256 baseRate;      // Annual percentage rate at 0% utilization.
+        uint256 slope1;        // Multiplier applied to utilization before the kink.
+        uint256 slope2;        // Aggressive multiplier applied after the kink.
+        uint256 kink;          // Utilization threshold where slope2 becomes active.
     }
 
     /**
-     * @notice Container for cryptographic signature data used in meta-transactions or permit-style logic.
-     * @param nonce Replay protection counter.
-     * @param deadline Unix timestamp after which the signature is invalid.
-     * @param signature The ECDSA signature bytes.
+     * @title User Records
+     * @notice Tracks account-level protocol activity.
      */
-    struct SignatureData {
+    struct User {
+        bool isActive;
+        uint256 lastUpdateTime;
         uint256 nonce;
-        uint256 deadline;
-        bytes signature;
     }
 
-    address[] public supportedTokens;
-    uint256 public constant LIQUIDATION_THRESHOLD = 8000; // 80% in basis point
-    uint256 public constant LIQUIDATION_PENALTY = 500; // 5% in basis point
-    uint256 public constant BASIS_POINTS = 10000;
+    // ============ STATE VARIABLES ============
 
-    // States Variables
     /**
-     * @notice Mapping of user addresses to their global protocol state.
+     * @notice Master price oracle reference for asset valuations.
+     */
+    IOracle public oracle;
+
+    /**
+     * @notice Canonical WETH address for native ETH wrapping.
+     */
+    address public wethAddress;
+
+    /**
+     * @notice Dynamic list of all market IDs registered in the system.
+     */
+    bytes32[] public supportedMarkets;
+
+    /**
+     * @notice Mapping of hashed identifiers to market configurations.
+     */
+    mapping(bytes32 => Market) public markets;
+
+    /**
+     * @notice Tracking of user deposits per market per address.
+     */
+    mapping(address => mapping(bytes32 => uint256)) public userDeposits;
+
+    /**
+     * @notice Tracking of gross user debt per market per address.
+     */
+    mapping(address => mapping(bytes32 => uint256)) public userBorrows;
+
+    /**
+     * @notice Registry of global user metadata and security nonces.
      */
     mapping(address => User) public users;
 
-    /**
-     * @notice Mapping of user address to token address to current deposit balance.
-     */
-    mapping(address => mapping(address => uint256)) public userDeposits;
+    // ============ EVENTS ============
+
+    event MarketAdded(bytes32 indexed marketId, address indexed token, uint256 collateralFactor, uint256 liquidationThreshold);
+    event MarketRemoved(bytes32 indexed marketId);
+    event Deposit(address indexed user, bytes32 indexed marketId, uint256 amount);
+    event Withdraw(address indexed user, bytes32 indexed marketId, uint256 amount);
+    event Borrow(address indexed user, bytes32 indexed marketId, uint256 amount);
+    event Repay(address indexed user, bytes32 indexed marketId, uint256 amount);
+    event Liquidate(address indexed liquidator, address indexed user, bytes32 indexed debtMarketId, uint256 collateralSeized);
+    event OracleUpdated(address indexed newOracle);
+
+    // ============ ERRORS ============
+
+    error InvalidAmount();
+    error InvalidAddress();
+    error MarketAlreadyExists();
+    error MarketNotActive();
+    error MarketNotEmpty();
+    error MaxMarketsReached();
+    error InsufficientTotalSupply();
+    error InsufficientDepositBalance();
+    error InsufficientBorrowBalance();
+    error UnsafePosition();
+    error PositionNotLiquidatable();
+    error NoCollateralToSeize();
+    error InsufficientBorrowToLiquidate();
+    error InsufficientCollateral();
+    error InvalidSignature();
+    error SignatureExpired();
+    error InvalidTokenAddress();
+    error InvalidPrice();
+    error InvalidRiskParameters();
+
+    // ============ CONSTRUCTOR ============
 
     /**
-     * @notice Mapping of user address to token address to current borrow balance.
+     * @notice Initializes the protocol V3, granting all initial roles to the deployer.
+     * @dev Author: Agustin Acosta
      */
-    mapping(address => mapping(address => uint256)) public userBorrows;
+    constructor() {
+        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _grantRole(MARKET_MANAGER_ROLE, msg.sender);
+        _grantRole(PAUSER_ROLE, msg.sender);
+        _grantRole(EMERGENCY_ROLE, msg.sender);
+    }
+
+    // ============ MODIFIERS ============
 
     /**
-     * @notice Mapping of token addresses to their corresponding market configuration and state.
+     * @notice Ensures the target market is operational.
      */
-    mapping(address => Market) public markets;
+    modifier onlyActiveMarket(bytes32 _marketId) {
+        if (!markets[_marketId].isActive) revert MarketNotActive();
+        _;
+    }
+
+    // ============ ADMIN ACTIONS ============
 
     /**
-     * @notice Tracking nonces for signature-based operations per user to prevent reattacks.
+     * @notice Point the protocol to a specific price oracle.
      */
-    mapping(address => uint256) public userNonces;
+    function setOracle(address _oracleAddress) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (_oracleAddress == address(0)) revert InvalidAddress();
+        oracle = IOracle(_oracleAddress);
+        emit OracleUpdated(_oracleAddress);
+    }
 
     /**
-     * @notice Protocol constructor setting the initial owner.
-     * @dev msg.sender is set as the initial owner via OpenZeppelin's Ownable.
+     * @notice Defines the canonical WETH implementation to use for native ETH deposits.
      */
-    constructor() Ownable(msg.sender) {}
+    function setWETH(address _wethAddress) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (_wethAddress == address(0)) revert InvalidAddress();
+        wethAddress = _wethAddress;
+    }
 
+    /**
+     * @notice Registers a new asset with safety and interest parameters.
+     * @dev Implements a Two-Slope Interest Model for dynamic rate adjustment.
+     */
+    function addMarket(
+        address _tokenAddress, 
+        bytes32 _salt, 
+        uint256 _collateralFactor, 
+        uint256 _liquidationThreshold,
+        uint256 _baseRate,
+        uint256 _slope1,
+        uint256 _slope2,
+        uint256 _kink
+    ) external onlyRole(MARKET_MANAGER_ROLE) {
+        if (_tokenAddress == address(0)) revert InvalidAddress();
+        if (_collateralFactor >= BASIS_POINTS || _liquidationThreshold <= _collateralFactor || _liquidationThreshold >= BASIS_POINTS) revert InvalidRiskParameters();
+        if (supportedMarkets.length >= MAX_MARKETS) revert MaxMarketsReached();
 
-    function addMarket(address _token, uint256 _collateralFactor, uint256 _initialSupplyRate, uint256 _initialBorrowRate) external onlyOwner {
-        if(_token == address(0)) revert InvalidTokenAddress();
-        if(_collateralFactor == 0 || _collateralFactor > BASIS_POINTS) revert InvalidCollateralFactor();
-        if(markets[_token].isActive) revert MarketAlreadyExists();
+        bytes32 marketId = keccak256(abi.encodePacked(_tokenAddress, _salt));
+        if (markets[marketId].isActive) revert MarketAlreadyExists();
 
-        supportedTokens.push(_token);
-        markets[_token] = Market({
-            token: IERC20(_token),
+        markets[marketId] = Market({
+            token: IERC20(_tokenAddress),
+            isActive: true,
+            collateralFactor: _collateralFactor,
+            liquidationThreshold: _liquidationThreshold,
             totalSupply: 0,
             totalBorrow: 0,
-            supplyRate: _initialSupplyRate,
-            borrowRate: _initialBorrowRate,
-            collateralFactor: _collateralFactor,
-            isActive: true
+            lastAccrualTime: block.timestamp,
+            baseRate: _baseRate,
+            slope1: _slope1,
+            slope2: _slope2,
+            kink: _kink
         });
 
-        emit MarketAdded(_token, _collateralFactor);
-    }
-
-    function updateMarket(address _token, uint256 _collateralFactor, uint256 _supplyRate, uint256 _borrowRate) external onlyOwner onlyActiveMarket(_token){
-        if(_collateralFactor == 0 || _collateralFactor > BASIS_POINTS) revert InvalidCollateralFactor();
-
-        markets[_token].collateralFactor = _collateralFactor;
-        markets[_token].supplyRate = _supplyRate;
-        markets[_token].borrowRate = _borrowRate;
-
-        emit MarketUpdated(_token, _collateralFactor);
-        emit RatesUpdated(_token, _supplyRate, _borrowRate);
-    }
-
-    function deposit(address _token, uint256 _amount) external onlyActiveMarket(_token) nonReentrant whenNotPaused {
-        if(_amount == 0) revert InvalidAmount();
-
-        IERC20(_token).safeTransferFrom(msg.sender, address(this), _amount);
-
-        userDeposits[msg.sender][_token] += _amount;
-        users[msg.sender].totalDeposited += _amount;
-        users[msg.sender].lastUpdateTime = block.timestamp;
-        users[msg.sender].isActive = true;
-
-        markets[_token].totalSupply += _amount;
-
-        emit Deposit(msg.sender, _token, _amount);
+        supportedMarkets.push(marketId);
+        emit MarketAdded(marketId, _tokenAddress, _collateralFactor, _liquidationThreshold);
     }
 
     /**
-     * @notice Deposits tokens into the protocol using a cryptographic signature for validation.
-     * @dev Follows the Checks-Effects-Interactions (CEI) pattern. Uses ECDSA for signature verification.
-     * @param _token The address of the token to deposit.
-     * @param _amount The amount of tokens to deposit.
-     * @param _sigData The signature and metadata (nonce, deadline).
+     * @notice Removes a market if it possesses no liquidity or debt.
+     */
+    function removeMarket(bytes32 _marketId) external onlyRole(MARKET_MANAGER_ROLE) {
+        if (!markets[_marketId].isActive) revert MarketNotActive();
+        if (markets[_marketId].totalSupply > 0) revert MarketNotEmpty();
+        delete markets[_marketId];
+        uint256 length = supportedMarkets.length;
+        for (uint256 i = 0; i < length; i++) {
+            if (supportedMarkets[i] == _marketId) {
+                supportedMarkets[i] = supportedMarkets[length - 1];
+                supportedMarkets.pop();
+                break;
+            }
+        }
+        emit MarketRemoved(_marketId);
+    }
+
+    /**
+     * @notice Imposes an emergency halt on the protocol.
+     */
+    function pause() external onlyRole(PAUSER_ROLE) { _pause(); }
+
+    /**
+     * @notice Lifts an emergency halt.
+     */
+    function unpause() external onlyRole(PAUSER_ROLE) { _unpause(); }
+
+    /**
+     * @notice Rescues ERC20 tokens mistakenly sent to the protocol.
+     */
+    function emergencyRecover(address _tokenAddress, uint256 _amount) external onlyRole(EMERGENCY_ROLE) {
+        if (_amount == 0) revert InvalidAmount();
+        IERC20(_tokenAddress).safeTransfer(msg.sender, _amount);
+    }
+
+    // ============ USER ACTIONS ============
+
+    /**
+     * @notice Supply ERC20 liquidity and earn interest.
+     */
+    function deposit(bytes32 _marketId, uint256 _amount) external onlyActiveMarket(_marketId) nonReentrant whenNotPaused {
+        if (_amount == 0) revert InvalidAmount();
+        _accrueInterest(_marketId);
+        Market storage market = markets[_marketId];
+        market.token.safeTransferFrom(msg.sender, address(this), _amount);
+        userDeposits[msg.sender][_marketId] += _amount;
+        market.totalSupply += _amount;
+        emit Deposit(msg.sender, _marketId, _amount);
+    }
+
+    /**
+     * @notice Supply native ETH into the protocol.
+     */
+    function depositETH(bytes32 _marketId) external payable onlyActiveMarket(_marketId) nonReentrant whenNotPaused {
+        if (msg.value == 0) revert InvalidAmount();
+        Market storage market = markets[_marketId];
+        if (address(market.token) != wethAddress) revert InvalidTokenAddress();
+        _accrueInterest(_marketId);
+        IWETH(wethAddress).deposit{value: msg.value}();
+        userDeposits[msg.sender][_marketId] += msg.value;
+        market.totalSupply += msg.value;
+        emit Deposit(msg.sender, _marketId, msg.value);
+    }
+
+    /**
+     * @notice Withdraw previously supplied liquidity.
+     */
+    function withdraw(bytes32 _marketId, uint256 _amount) external onlyActiveMarket(_marketId) nonReentrant whenNotPaused {
+        if (_amount == 0) revert InvalidAmount();
+        _accrueInterest(_marketId);
+        if (userDeposits[msg.sender][_marketId] < _amount) revert InsufficientDepositBalance();
+        if (!canWithdraw(msg.sender, _marketId, _amount)) revert UnsafePosition();
+        Market storage market = markets[_marketId];
+        userDeposits[msg.sender][_marketId] -= _amount;
+        market.totalSupply -= _amount;
+        market.token.safeTransfer(msg.sender, _amount);
+        emit Withdraw(msg.sender, _marketId, _amount);
+    }
+
+    /**
+     * @notice Borrow assets from a specific market pool.
+     */
+    function borrow(bytes32 _marketId, uint256 _amount) external onlyActiveMarket(_marketId) nonReentrant whenNotPaused {
+        if (_amount == 0) revert InvalidAmount();
+        _accrueInterest(_marketId);
+        Market storage market = markets[_marketId];
+        if (market.token.balanceOf(address(this)) < _amount) revert InsufficientTotalSupply();
+        if (!canBorrow(msg.sender, _marketId, _amount)) revert UnsafePosition();
+        userBorrows[msg.sender][_marketId] += _amount;
+        market.totalBorrow += _amount;
+        market.totalSupply -= _amount; 
+        market.token.safeTransfer(msg.sender, _amount);
+        emit Borrow(msg.sender, _marketId, _amount);
+    }
+
+    /**
+     * @notice Repay an outstanding borrow position.
+     */
+    function repay(bytes32 _marketId, uint256 _amount) external onlyActiveMarket(_marketId) nonReentrant whenNotPaused {
+        if (_amount == 0) revert InvalidAmount();
+        _accrueInterest(_marketId);
+        Market storage market = markets[_marketId];
+        if (userBorrows[msg.sender][_marketId] < _amount) revert InsufficientBorrowBalance();
+        market.token.safeTransferFrom(msg.sender, address(this), _amount);
+        userBorrows[msg.sender][_marketId] -= _amount;
+        market.totalBorrow -= _amount;
+        market.totalSupply += _amount;
+        emit Repay(msg.sender, _marketId, _amount);
+    }
+
+    /**
+     * @notice Forced liquidation of a user account in default.
+     */
+    function liquidate(address _user, bytes32 _debtMarketId, uint256 _amount) external nonReentrant whenNotPaused onlyActiveMarket(_debtMarketId) {
+        if (_amount == 0) revert InvalidAmount();
+        _accrueInterest(_debtMarketId);
+        if (userBorrows[_user][_debtMarketId] < _amount) revert InsufficientBorrowToLiquidate();
+        if (!isLiquidatable(_user)) revert PositionNotLiquidatable();
+        uint256 collateralValueUSD = (_amount * getPrice(address(markets[_debtMarketId].token)) * (BASIS_POINTS + LIQUIDATION_PENALTY)) / (BASIS_POINTS);
+        bytes32 collateralMid = findBestCollateral(_user);
+        if (collateralMid == bytes32(0)) revert NoCollateralToSeize();
+        uint256 collateralPrice = getPrice(address(markets[collateralMid].token));
+        uint256 amountToSeize = (collateralValueUSD) / collateralPrice;
+        if (userDeposits[_user][collateralMid] < amountToSeize) revert InsufficientCollateral();
+        userBorrows[_user][_debtMarketId] -= _amount;
+        markets[_debtMarketId].totalBorrow -= _amount;
+        markets[_debtMarketId].totalSupply += _amount;
+        userDeposits[_user][collateralMid] -= amountToSeize;
+        markets[collateralMid].totalSupply -= amountToSeize;
+        markets[_debtMarketId].token.safeTransferFrom(msg.sender, address(this), _amount);
+        markets[collateralMid].token.safeTransfer(msg.sender, amountToSeize);
+        emit Liquidate(msg.sender, _user, _debtMarketId, amountToSeize);
+    }
+
+    /**
+     * @notice Processes a collateral deposit via an authorized offline signature.
      */
     function depositWithSignature(
-        address _token, 
+        address _user, 
+        bytes32 _marketId, 
         uint256 _amount, 
-        SignatureData calldata _sigData
-    ) 
-        external 
-        nonReentrant 
-        whenNotPaused 
-        onlyActiveMarket(_token) 
-        onlyValidSignature(_sigData) 
-    {
-        if(_amount == 0) revert InvalidAmount();
-
-        // Verify signature
-        bytes32 messageHash = keccak256(abi.encodePacked(
-            "deposit",
-            _token,
-            _amount,
-            _sigData.nonce,
-            _sigData.deadline
-        ));
-        
-        bytes32 ethSignedMessageHash = MessageHashUtils.toEthSignedMessageHash(messageHash);
-        address signer = ethSignedMessageHash.recover(_sigData.signature);
-        if(signer != msg.sender) revert InvalidSignature();
-        if(signer == address(0)) revert InvalidSignature();
-
-        // --- Effects ---
-        userDeposits[msg.sender][_token] += _amount;
-        users[msg.sender].totalDeposited += _amount;
-        users[msg.sender].lastUpdateTime = block.timestamp;
-        users[msg.sender].isActive = true;
-
-        markets[_token].totalSupply += _amount;
-
-        emit Deposit(msg.sender, _token, _amount);
-
-        // --- Interactions ---
-        IERC20(_token).safeTransferFrom(msg.sender, address(this), _amount);
+        uint256 _deadline, 
+        bytes calldata _signature
+    ) external onlyActiveMarket(_marketId) nonReentrant whenNotPaused {
+        if (_amount == 0) revert InvalidAmount();
+        _validateSignature(_user, _marketId, _amount, _deadline, _signature);
+        _accrueInterest(_marketId);
+        markets[_marketId].token.safeTransferFrom(_user, address(this), _amount);
+        userDeposits[_user][_marketId] += _amount;
+        markets[_marketId].totalSupply += _amount;
+        emit Deposit(_user, _marketId, _amount);
     }
 
-    function withdraw(address _token, uint256 _amount) external onlyActiveMarket(_token) nonReentrant whenNotPaused {
-        if(_amount == 0) revert InvalidAmount();
-        if(userDeposits[msg.sender][_token] < _amount) revert InsufficientDepositBalance();
-        if(!canWithdraw(msg.sender, _token, _amount)) revert UnsafePosition();
-
-        userDeposits[msg.sender][_token] -= _amount;
-        users[msg.sender].totalDeposited -= _amount;
-        users[msg.sender].lastUpdateTime = block.timestamp;
-
-        if(users[msg.sender].totalDeposited == 0){
-            users[msg.sender].isActive = false;
-        }
-
-        markets[_token].totalSupply -= _amount;
-
-        IERC20(_token).safeTransfer(msg.sender, _amount);
-
-        emit Withdraw(msg.sender, _token, _amount);
-    }
-
-    function borrow(address _token, uint256 _amount) external onlyActiveMarket(_token) nonReentrant whenNotPaused {
-        if(_amount == 0) revert InvalidAmount();
-        if(markets[_token].totalSupply < _amount) revert InsufficientTotalSupply();
-        if(!canBorrow(msg.sender, _token, _amount)) revert UnsafePosition();
-
-        userBorrows[msg.sender][_token] += _amount;
-        users[msg.sender].totalBorrowed += _amount;
-        users[msg.sender].lastUpdateTime = block.timestamp;
-        users[msg.sender].isActive = true;
-
-        markets[_token].totalBorrow += _amount;
-
-        IERC20(_token).safeTransfer(msg.sender, _amount);
-
-        emit Borrow(msg.sender, _token, _amount);
-    }
-
-    function repay(address _token, uint256 _amount) external onlyActiveMarket(_token) nonReentrant whenNotPaused {
-        if(_amount == 0) revert InvalidAmount();
-        if(userBorrows[msg.sender][_token] < _amount) revert InsufficientBorrowBalance();
-
-        IERC20(_token).safeTransferFrom(msg.sender, address(this), _amount);
-
-        userBorrows[msg.sender][_token] -= _amount;
-        users[msg.sender].totalBorrowed -= _amount;
-        users[msg.sender].lastUpdateTime = block.timestamp;
-
-        if(users[msg.sender].totalBorrowed == 0){
-            users[msg.sender].isActive = false;
-        }
-        
-        markets[_token].totalBorrow -= _amount;
-
-        emit Repay(msg.sender, _token, _amount);
-    }
+    // ============ INTERNAL ============
 
     /**
-     * @notice Liquidates an unhealthy position by repaying debt and seizing collateral at a discount.
-     * @dev Follows the Checks-Effects-Interactions (CEI) pattern to prevent reentrancy and uses custom errors for gas efficiency.
-     * @param _user The address of the borrower whose position is being liquidated.
-     * @param _token The address of the borrowed token being repaid.
-     * @param _amount The amount of debt to repay.
+     * @notice Internal validation for meta-transactions.
+     * @dev Author: Agustin Acosta. Explicitly clears stack from parameters.
      */
-    function liquidate(address _user, address _token, uint256 _amount) external nonReentrant whenNotPaused onlyActiveMarket(_token) {
-        if(_amount == 0) revert InvalidAmount();
-        if(userBorrows[_user][_token] < _amount) revert InsufficientBorrowToLiquidate();
-        if(!isLiquidatable(_user)) revert PositionNotLiquidatable();
-        
-        uint256 collateralToSeize = (_amount * (BASIS_POINTS + LIQUIDATION_PENALTY)) / BASIS_POINTS;
-        
-        address collateralToken = findBestCollateral(_user);
-        if(collateralToken == address(0)) revert NoCollateralToSeize();
-        if(userDeposits[_user][collateralToken] < collateralToSeize) revert InsufficientCollateral();
-        
-        // --- Effects ---
-        userBorrows[_user][_token] -= _amount;
-        users[_user].totalBorrowed -= _amount;
-        markets[_token].totalBorrow -= _amount;
-
-        userDeposits[_user][collateralToken] -= collateralToSeize;
-        users[_user].totalDeposited -= collateralToSeize;
-        markets[collateralToken].totalSupply -= collateralToSeize;
-        
-        users[_user].lastUpdateTime = block.timestamp;
-
-        if(users[_user].totalBorrowed == 0 && users[_user].totalDeposited == 0){
-            users[_user].isActive = false;
-        }
-
-        // --- Interactions ---
-        IERC20(_token).safeTransferFrom(msg.sender, address(this), _amount);
-        IERC20(collateralToken).safeTransfer(msg.sender, collateralToSeize);
-        
-        emit Liquidate(msg.sender, _user, _token, _amount);
+    function _validateSignature(
+        address _user, 
+        bytes32 _marketId, 
+        uint256 _amount, 
+        uint256 _deadline, 
+        bytes calldata _signature
+    ) internal {
+        if (block.timestamp > _deadline) revert SignatureExpired();
+        bytes32 structHash = keccak256(abi.encode(_marketId, _amount, users[_user].nonce, _deadline));
+        bytes32 h = MessageHashUtils.toEthSignedMessageHash(structHash);
+        if (ECDSA.recover(h, _signature) != _user) revert InvalidSignature();
+        users[_user].nonce++;
     }
 
     /**
-     * @notice Checks if a user's position is below the liquidation threshold.
-     * @param _user The address to check.
-     * @return bool True if the position can be liquidated.
+     * @notice Applies time-weighted interest to market pools.
+     */
+    function _accrueInterest(bytes32 _marketId) internal {
+        Market storage market = markets[_marketId];
+        uint256 timeDelta = block.timestamp - market.lastAccrualTime;
+        if (timeDelta > 0 && market.totalBorrow > 0) {
+            uint256 utilization = (market.totalBorrow * 1e18) / (market.totalSupply + market.totalBorrow);
+            uint256 borrowRate;
+            if (utilization <= market.kink) {
+                borrowRate = market.baseRate + (utilization * market.slope1 / 1e18);
+            } else {
+                uint256 normalRate = market.baseRate + (market.kink * market.slope1 / 1e18);
+                uint256 excessUtilization = utilization - market.kink;
+                borrowRate = normalRate + (excessUtilization * market.slope2 / 1e18);
+            }
+            uint256 interest = (market.totalBorrow * borrowRate * timeDelta) / (365 days * 1e18);
+            market.totalBorrow += interest;
+            market.totalSupply += (interest * (BASIS_POINTS - RESERVE_FACTOR)) / BASIS_POINTS;
+        }
+        market.lastAccrualTime = block.timestamp;
+    }
+
+    /**
+     * @notice Retrieves current price for an asset.
+     */
+    function getPrice(address _tokenAddress) public view returns (uint256) {
+        uint256 price = oracle.getPrice(_tokenAddress);
+        if (price == 0) revert InvalidPrice();
+        return price;
+    }
+
+    /**
+     * @notice Summarizes user collateral value weighted by risk factors.
+     */
+    function getAccountCollateralValue(address _user) public view returns (uint256) {
+        uint256 total = 0;
+        for (uint256 i = 0; i < supportedMarkets.length; i++) {
+            bytes32 mId = supportedMarkets[i];
+            total += (userDeposits[_user][mId] * getPrice(address(markets[mId].token)) * markets[mId].collateralFactor) / (1e18 * BASIS_POINTS);
+        }
+        return total;
+    }
+
+    /**
+     * @notice Summarizes user value weighted by liquidation thresholds.
+     */
+    function getAccountLiquidationValue(address _user) public view returns (uint256) {
+        uint256 total = 0;
+        for (uint256 i = 0; i < supportedMarkets.length; i++) {
+            bytes32 mId = supportedMarkets[i];
+            total += (userDeposits[_user][mId] * getPrice(address(markets[mId].token)) * markets[mId].liquidationThreshold) / (1e18 * BASIS_POINTS);
+        }
+        return total;
+    }
+
+    /**
+     * @notice Aggregates gross debt value of a user across all markets.
+     */
+    function getAccountDebtValue(address _user) public view returns (uint256) {
+        uint256 total = 0;
+        for (uint256 i = 0; i < supportedMarkets.length; i++) {
+            bytes32 mId = supportedMarkets[i];
+            total += (userBorrows[_user][mId] * getPrice(address(markets[mId].token))) / 1e18;
+        }
+        return total;
+    }
+
+    /**
+     * @notice Evaluates if an account is eligible for liquidation.
      */
     function isLiquidatable(address _user) public view returns (bool) {
-        uint256 ratio = getCollateralizationRatio(_user);
-        return ratio < LIQUIDATION_THRESHOLD;
+        uint256 debtValue = getAccountDebtValue(_user);
+        return debtValue > 0 && getAccountLiquidationValue(_user) < debtValue;
     }
 
     /**
-     * @notice Searches for the best collateral token based on the highest adjusted collateral value.
-     * @dev Iterates through all markets to find the asset where the user has the most value (amount * factor).
-     * @param _user The address of the borrower.
-     * @return address The address of the token with the highest collateral value, or address(0) if none found.
+     * @notice Simulates result of a withdrawal.
      */
-    function findBestCollateral(address _user) internal view returns (address) {
-        address bestToken = address(0);
-        uint256 bestValue = 0;
-        
-        uint256 length = supportedTokens.length;
-        for(uint256 i = 0; i < length; i++){
-            address token = supportedTokens[i];
-            if(markets[token].isActive && userDeposits[_user][token] > 0){
-                uint256 value = (userDeposits[_user][token] * markets[token].collateralFactor) / BASIS_POINTS;
-                if(value > bestValue){
-                    bestValue = value;
-                    bestToken = token;
-                }
-            }
+    function canWithdraw(address _user, bytes32 _marketId, uint256 _amount) public view returns (bool) {
+        uint256 debtValue = getAccountDebtValue(_user);
+        if (debtValue == 0) return true;
+        uint256 projectedValue = 0;
+        for (uint256 i = 0; i < supportedMarkets.length; i++) {
+            bytes32 mId = supportedMarkets[i];
+            uint256 currentBalance = userDeposits[_user][mId];
+            if (mId == _marketId) currentBalance = currentBalance > _amount ? currentBalance - _amount : 0;
+            projectedValue += (currentBalance * getPrice(address(markets[mId].token)) * markets[mId].collateralFactor) / (1e18 * BASIS_POINTS);
         }
-        return bestToken;
+        return projectedValue >= debtValue;
     }
 
-    function canWithdraw(address _user, address _token, uint256 _amount) public view returns (bool) {
-        uint256 currentRatio = getCollateralizationRatio(_user);
-        if(currentRatio == type(uint256).max) return true;
-        
-        uint256 newCollateralValue = 0;
-        uint256 totalBorrowValue = 0;
+    /**
+     * @notice Simulates result of a borrow operation.
+     */
+    function canBorrow(address _user, bytes32 _marketId, uint256 _amount) public view returns (bool) {
+        uint256 currentCollateralValue = getAccountCollateralValue(_user);
+        uint256 newDebtValue = getAccountDebtValue(_user) + (_amount * getPrice(address(markets[_marketId].token))) / 1e18;
+        return currentCollateralValue >= newDebtValue;
+    }
 
-        for(uint i = 0; i < supportedTokens.length; i++){
-            address supportedToken = supportedTokens[i];
-            if(markets[supportedToken].isActive){
-                uint256 depositAmount = userDeposits[_user][supportedToken];
-                uint256 borrowAmount = userBorrows[_user][supportedToken];
-                
-                if(supportedToken == _token){
-                    depositAmount = depositAmount > _amount ? depositAmount - _amount : 0;
-                }
-
-                if(depositAmount > 0){
-                    newCollateralValue += (depositAmount * markets[supportedToken].collateralFactor) / BASIS_POINTS;
-                }
-
-                if(borrowAmount > 0){
-                    totalBorrowValue += (borrowAmount * markets[supportedToken].collateralFactor) / BASIS_POINTS;
-                }
-            }
+    /**
+     * @notice Locates the asset with the highest USD market value for a user.
+     */
+    function findBestCollateral(address _user) public view returns (bytes32) {
+        bytes32 topMarketId; uint256 maxUSDValue = 0;
+        for (uint256 i = 0; i < supportedMarkets.length; i++) {
+            bytes32 activeMarketId = supportedMarkets[i];
+            uint256 currentUSDValue = (userDeposits[_user][activeMarketId] * getPrice(address(markets[activeMarketId].token))) / 1e18;
+            if (currentUSDValue > maxUSDValue) { maxUSDValue = currentUSDValue; topMarketId = activeMarketId; }
         }
-
-        if(totalBorrowValue == 0) return true;
-
-        uint256 newRatio = (newCollateralValue * BASIS_POINTS) / totalBorrowValue;
-        return newRatio >= LIQUIDATION_THRESHOLD;
+        return topMarketId;
     }
 
     /**
-     * @notice Checks if a user is eligible to borrow a specific amount of tokens based on their collateral.
-     * @dev Simulates the resulting global collateralization ratio to ensure it stays above the liquidation threshold.
-     * @param _user The address of the borrower.
-     * @param _token The address of the token being borrowed.
-     * @param _amount The amount of the token requested.
-     * @return bool True if the borrow maintains a healthy position, false otherwise.
+     * @notice Returns list of active market IDs.
      */
-    function canBorrow(address _user, address _token, uint256 _amount) public view returns (bool) {
-        uint256 currentRatio = getCollateralizationRatio(_user);
-        
-        // Even if there is no current debt, we must simulate the new borrow to ensure health
-        uint256 totalCollateralValue = 0;
-        uint256 totalBorrowValue = 0;
-
-        uint256 length = supportedTokens.length;
-        for (uint256 i = 0; i < length; i++) {
-            address supportedToken = supportedTokens[i];
-            if (markets[supportedToken].isActive) {
-                uint256 depositAmount = userDeposits[_user][supportedToken];
-                uint256 borrowAmount = userBorrows[_user][supportedToken];
-
-                if (supportedToken == _token) {
-                    borrowAmount += _amount;
-                }
-
-                if (depositAmount > 0) {
-                    totalCollateralValue += (depositAmount * markets[supportedToken].collateralFactor) / BASIS_POINTS;
-                }
-
-                if (borrowAmount > 0) {
-                    totalBorrowValue += borrowAmount;
-                }
-            }
-        }
-
-        if (totalBorrowValue == 0) return true;
-
-        uint256 newRatio = (totalCollateralValue * BASIS_POINTS) / totalBorrowValue;
-        return newRatio >= LIQUIDATION_THRESHOLD;
-    }
-
+    function getSupportedMarkets() external view returns (bytes32[] memory) { return supportedMarkets; }
     /**
-     * @notice Calculates the current overall collateralization ratio for a user's entire portfolio.
-     * @param _user The address of the user to check.
-     * @return uint256 The global ratio in basis points, or type(uint256).max if the user has no debt.
+     * @notice Returns security nonce for a specific user.
      */
-    function getCollateralizationRatio(address _user) public view returns (uint256) {
-        uint256 totalCollateral = 0;
-        uint256 totalDebt = 0;
-
-        uint256 length = supportedTokens.length;
-        for (uint256 i = 0; i < length; i++) {
-            address token = supportedTokens[i];
-            
-            if (markets[token].isActive) {
-                uint256 depositAmount = userDeposits[_user][token];
-                uint256 borrowAmount = userBorrows[_user][token];
-
-                if (depositAmount > 0) {
-                    totalCollateral += (depositAmount * markets[token].collateralFactor) / BASIS_POINTS;
-                }
-                
-                if (borrowAmount > 0) {
-                    totalDebt += borrowAmount;
-                }
-            }
-        }
-
-        if (totalDebt == 0) return type(uint256).max;
-        
-        return (totalCollateral * BASIS_POINTS) / totalDebt;
-    }
-
-    function pause() external onlyOwner{
-        _pause();
-    }
-
-    function unpause() external onlyOwner{
-        _unpause();
-    }
-
+    function getUserNonce(address _userAddress) external view returns (uint256) { return users[_userAddress].nonce; }
     /**
-     * @notice Safely recovers any ERC20 tokens sent to the contract by mistake.
-     * @param _token The address of the token to recover.
-     * @param _recipient The address to send the recovered tokens to.
-     * @param _amount The amount of tokens to recover.
+     * @notice Detailed configuration info for a market.
      */
-    function emergencyRecover(address _token, address _recipient, uint256 _amount) external onlyOwner {
-        if(_recipient == address(0)) revert InvalidRecipient();
-        IERC20(_token).safeTransfer(_recipient, _amount);
-    }
-
-    // ============ VIEW GETTERS ============
-
-    /**
-     * @notice Retrieves the current configuration and state of a market.
-     * @param _token The address of the market token.
-     * @return Market struct containing the market state.
-     */
-    function getMarket(address _token) external view returns (Market memory) {
-        return markets[_token];
-    }
-
-    /**
-     * @notice Retrieves the overall state of a specific user.
-     * @param _user The address of the user.
-     * @return User struct containing user state details.
-     */
-    function getUser(address _user) external view returns (User memory) {
-        return users[_user];
-    }
-
-    /**
-     * @notice Retrieves the deposited amount of a specific token for a user.
-     * @param _user The address of the user.
-     * @param _token The address of the token.
-     * @return uint256 The deposited balance.
-     */
-    function getUserDeposit(address _user, address _token) external view returns (uint256) {
-        return userDeposits[_user][_token];
-    }
-
-    /**
-     * @notice Retrieves the borrowed amount of a specific token for a user.
-     * @param _user The address of the user.
-     * @param _token The address of the token.
-     * @return uint256 The borrowed balance.
-     */
-    function getUserBorrow(address _user, address _token) external view returns (uint256) {
-        return userBorrows[_user][_token];
-    }
-
-    /**
-     * @notice Returns an array of all supported market tokens.
-     * @return address[] An array of token addresses.
-     */
-    function getSupportedTokens() external view returns (address[] memory) {
-        return supportedTokens;
-    }
-
-    /**
-     * @notice Retrieves the current replay-protection nonce for a user's signature.
-     * @param _user The address of the user.
-     * @return uint256 The current nonce.
-     */
-    function getNonce(address _user) external view returns (uint256) {
-        return userNonces[_user];
-    }
+    function getMarketInfo(bytes32 _marketId) external view returns (Market memory) { return markets[_marketId]; }
 }
