@@ -270,8 +270,112 @@ contract LendingProtocol is ReentrancyGuard, Pausable, Ownable {
         emit Repay(msg.sender, _token, _amount);
     }
 
+    function canWithdraw(address _user, address _token, uint256 _amount) public view returns (bool) {
+        uint256 currentRatio = getCollateralizationRatio(_user);
+        if(currentRatio == type(uint256).max) return true;
+        
+        uint256 newCollateralValue = 0;
+        uint256 totalBorrowValue = 0;
 
+        for(uint i = 0; i < supportedTokens.length; i++){
+            address supportedToken = supportedTokens[i];
+            if(markets[supportedToken].isActive){
+                uint256 depositAmount = userDeposits[_user][supportedToken];
+                uint256 borrowAmount = userBorrows[_user][supportedToken];
+                
+                if(supportedToken == _token){
+                    depositAmount = depositAmount > _amount ? depositAmount - _amount : 0;
+                }
 
+                if(depositAmount > 0){
+                    newCollateralValue += (depositAmount * markets[supportedToken].collateralFactor) / BASIS_POINTS;
+                }
+
+                if(borrowAmount > 0){
+                    totalBorrowValue += (borrowAmount * markets[supportedToken].collateralFactor) / BASIS_POINTS;
+                }
+            }
+        }
+
+        if(totalBorrowValue == 0) return true;
+
+        uint256 newRatio = (newCollateralValue * BASIS_POINTS) / totalBorrowValue;
+        return newRatio >= LIQUIDATION_THRESHOLD;
+    }
+
+    /**
+     * @notice Checks if a user is eligible to borrow a specific amount of tokens based on their collateral.
+     * @dev Simulates the resulting global collateralization ratio to ensure it stays above the liquidation threshold.
+     * @param _user The address of the borrower.
+     * @param _token The address of the token being borrowed.
+     * @param _amount The amount of the token requested.
+     * @return bool True if the borrow maintains a healthy position, false otherwise.
+     */
+    function canBorrow(address _user, address _token, uint256 _amount) public view returns (bool) {
+        uint256 currentRatio = getCollateralizationRatio(_user);
+        
+        // Even if there is no current debt, we must simulate the new borrow to ensure health
+        uint256 totalCollateralValue = 0;
+        uint256 totalBorrowValue = 0;
+
+        uint256 length = supportedTokens.length;
+        for (uint256 i = 0; i < length; i++) {
+            address supportedToken = supportedTokens[i];
+            if (markets[supportedToken].isActive) {
+                uint256 depositAmount = userDeposits[_user][supportedToken];
+                uint256 borrowAmount = userBorrows[_user][supportedToken];
+
+                if (supportedToken == _token) {
+                    borrowAmount += _amount;
+                }
+
+                if (depositAmount > 0) {
+                    totalCollateralValue += (depositAmount * markets[supportedToken].collateralFactor) / BASIS_POINTS;
+                }
+
+                if (borrowAmount > 0) {
+                    totalBorrowValue += borrowAmount;
+                }
+            }
+        }
+
+        if (totalBorrowValue == 0) return true;
+
+        uint256 newRatio = (totalCollateralValue * BASIS_POINTS) / totalBorrowValue;
+        return newRatio >= LIQUIDATION_THRESHOLD;
+    }
+
+    /**
+     * @notice Calculates the current overall collateralization ratio for a user's entire portfolio.
+     * @param _user The address of the user to check.
+     * @return uint256 The global ratio in basis points, or type(uint256).max if the user has no debt.
+     */
+    function getCollateralizationRatio(address _user) public view returns (uint256) {
+        uint256 totalCollateral = 0;
+        uint256 totalDebt = 0;
+
+        uint256 length = supportedTokens.length;
+        for (uint256 i = 0; i < length; i++) {
+            address token = supportedTokens[i];
+            
+            if (markets[token].isActive) {
+                uint256 depositAmount = userDeposits[_user][token];
+                uint256 borrowAmount = userBorrows[_user][token];
+
+                if (depositAmount > 0) {
+                    totalCollateral += (depositAmount * markets[token].collateralFactor) / BASIS_POINTS;
+                }
+                
+                if (borrowAmount > 0) {
+                    totalDebt += borrowAmount;
+                }
+            }
+        }
+
+        if (totalDebt == 0) return type(uint256).max;
+        
+        return (totalCollateral * BASIS_POINTS) / totalDebt;
+    }
 
     function pause() external onlyOwner{
         _pause();
