@@ -88,7 +88,7 @@ contract LendingProtocol is ReentrancyGuard, Pausable, Ownable {
     event RatesUpdated(address indexed token, uint256 supplyRate, uint256 borrowRate);
 
     modifier onlyActiveMarket(address token){
-        require(markets[token].isActive, "Market is not active");
+        if(!markets[token].isActive) revert MarketNotActive();
         _;
     }
 
@@ -119,6 +119,24 @@ contract LendingProtocol is ReentrancyGuard, Pausable, Ownable {
     error InvalidNonce();
     /// @notice Raised when the cryptographic signature recovery does not match the expected signer.
     error InvalidSignature();
+    /// @notice Raised when trying to interact with a market that is not active.
+    error MarketNotActive();
+    /// @notice Raised when the token address provided is zero address.
+    error InvalidTokenAddress();
+    /// @notice Raised when the collateral factor is out of bounds (0 or > BASIS_POINTS).
+    error InvalidCollateralFactor();
+    /// @notice Raised when attempting to add a token that is already a valid market.
+    error MarketAlreadyExists();
+    /// @notice Raised when a user tries to withdraw more than their deposited balance.
+    error InsufficientDepositBalance();
+    /// @notice Raised when an action would leave the user's health factor below the liquidation threshold.
+    error UnsafePosition();
+    /// @notice Raised when the market doesn't have enough tokens to fulfill a borrow.
+    error InsufficientTotalSupply();
+    /// @notice Raised when trying to repay more than the owed debt.
+    error InsufficientBorrowBalance();
+    /// @notice Raised when the recipient address for emergency recovery is zero address.
+    error InvalidRecipient();
 
     /**
      * @notice Represents the protocol state for an individual user.
@@ -196,9 +214,9 @@ contract LendingProtocol is ReentrancyGuard, Pausable, Ownable {
 
 
     function addMarket(address _token, uint256 _collateralFactor, uint256 _initialSupplyRate, uint256 _initialBorrowRate) external onlyOwner {
-        require(_token != address(0), "Invalid token address");
-        require(_collateralFactor > 0 && _collateralFactor <= BASIS_POINTS, "Invalid collateral factor");
-        require(!markets[_token].isActive, "Market already exists");
+        if(_token == address(0)) revert InvalidTokenAddress();
+        if(_collateralFactor == 0 || _collateralFactor > BASIS_POINTS) revert InvalidCollateralFactor();
+        if(markets[_token].isActive) revert MarketAlreadyExists();
 
         supportedTokens.push(_token);
         markets[_token] = Market({
@@ -215,7 +233,7 @@ contract LendingProtocol is ReentrancyGuard, Pausable, Ownable {
     }
 
     function updateMarket(address _token, uint256 _collateralFactor, uint256 _supplyRate, uint256 _borrowRate) external onlyOwner onlyActiveMarket(_token){
-        require(_collateralFactor > 0 && _collateralFactor <= BASIS_POINTS, "Invalid collateral factor");
+        if(_collateralFactor == 0 || _collateralFactor > BASIS_POINTS) revert InvalidCollateralFactor();
 
         markets[_token].collateralFactor = _collateralFactor;
         markets[_token].supplyRate = _supplyRate;
@@ -225,9 +243,8 @@ contract LendingProtocol is ReentrancyGuard, Pausable, Ownable {
         emit RatesUpdated(_token, _supplyRate, _borrowRate);
     }
 
-
     function deposit(address _token, uint256 _amount) external onlyActiveMarket(_token) nonReentrant whenNotPaused {
-        require(_amount > 0, "Amount must be greater than 0");
+        if(_amount == 0) revert InvalidAmount();
 
         IERC20(_token).safeTransferFrom(msg.sender, address(this), _amount);
 
@@ -290,9 +307,9 @@ contract LendingProtocol is ReentrancyGuard, Pausable, Ownable {
     }
 
     function withdraw(address _token, uint256 _amount) external onlyActiveMarket(_token) nonReentrant whenNotPaused {
-        require(_amount > 0, "Amount must be greater than 0");
-        require(userDeposits[msg.sender][_token] >= _amount, "Insufficient deposit balance");
-        require(canWithdraw(msg.sender, _token, _amount), "Withdrawal would make position unhealthy");
+        if(_amount == 0) revert InvalidAmount();
+        if(userDeposits[msg.sender][_token] < _amount) revert InsufficientDepositBalance();
+        if(!canWithdraw(msg.sender, _token, _amount)) revert UnsafePosition();
 
         userDeposits[msg.sender][_token] -= _amount;
         users[msg.sender].totalDeposited -= _amount;
@@ -310,10 +327,9 @@ contract LendingProtocol is ReentrancyGuard, Pausable, Ownable {
     }
 
     function borrow(address _token, uint256 _amount) external onlyActiveMarket(_token) nonReentrant whenNotPaused {
-        require(_amount > 0, "Amount must be greater than 0");
-        require(markets[_token].isActive, "Market is not active");
-        require(markets[_token].totalSupply >= _amount, "Insufficient total supply");
-        require(canBorrow(msg.sender, _token, _amount), "Borrow would make position unhealthy");
+        if(_amount == 0) revert InvalidAmount();
+        if(markets[_token].totalSupply < _amount) revert InsufficientTotalSupply();
+        if(!canBorrow(msg.sender, _token, _amount)) revert UnsafePosition();
 
         userBorrows[msg.sender][_token] += _amount;
         users[msg.sender].totalBorrowed += _amount;
@@ -328,8 +344,8 @@ contract LendingProtocol is ReentrancyGuard, Pausable, Ownable {
     }
 
     function repay(address _token, uint256 _amount) external onlyActiveMarket(_token) nonReentrant whenNotPaused {
-        require(_amount > 0, "Amount must be greater than 0");
-        require(userBorrows[msg.sender][_token] >= _amount, "Insufficient borrow balance");
+        if(_amount == 0) revert InvalidAmount();
+        if(userBorrows[msg.sender][_token] < _amount) revert InsufficientBorrowBalance();
 
         IERC20(_token).safeTransferFrom(msg.sender, address(this), _amount);
 
@@ -535,4 +551,71 @@ contract LendingProtocol is ReentrancyGuard, Pausable, Ownable {
         _unpause();
     }
 
+    /**
+     * @notice Safely recovers any ERC20 tokens sent to the contract by mistake.
+     * @param _token The address of the token to recover.
+     * @param _recipient The address to send the recovered tokens to.
+     * @param _amount The amount of tokens to recover.
+     */
+    function emergencyRecover(address _token, address _recipient, uint256 _amount) external onlyOwner {
+        if(_recipient == address(0)) revert InvalidRecipient();
+        IERC20(_token).safeTransfer(_recipient, _amount);
+    }
+
+    // ============ VIEW GETTERS ============
+
+    /**
+     * @notice Retrieves the current configuration and state of a market.
+     * @param _token The address of the market token.
+     * @return Market struct containing the market state.
+     */
+    function getMarket(address _token) external view returns (Market memory) {
+        return markets[_token];
+    }
+
+    /**
+     * @notice Retrieves the overall state of a specific user.
+     * @param _user The address of the user.
+     * @return User struct containing user state details.
+     */
+    function getUser(address _user) external view returns (User memory) {
+        return users[_user];
+    }
+
+    /**
+     * @notice Retrieves the deposited amount of a specific token for a user.
+     * @param _user The address of the user.
+     * @param _token The address of the token.
+     * @return uint256 The deposited balance.
+     */
+    function getUserDeposit(address _user, address _token) external view returns (uint256) {
+        return userDeposits[_user][_token];
+    }
+
+    /**
+     * @notice Retrieves the borrowed amount of a specific token for a user.
+     * @param _user The address of the user.
+     * @param _token The address of the token.
+     * @return uint256 The borrowed balance.
+     */
+    function getUserBorrow(address _user, address _token) external view returns (uint256) {
+        return userBorrows[_user][_token];
+    }
+
+    /**
+     * @notice Returns an array of all supported market tokens.
+     * @return address[] An array of token addresses.
+     */
+    function getSupportedTokens() external view returns (address[] memory) {
+        return supportedTokens;
+    }
+
+    /**
+     * @notice Retrieves the current replay-protection nonce for a user's signature.
+     * @param _user The address of the user.
+     * @return uint256 The current nonce.
+     */
+    function getNonce(address _user) external view returns (uint256) {
+        return userNonces[_user];
+    }
 }

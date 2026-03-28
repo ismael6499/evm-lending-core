@@ -11,8 +11,8 @@ import "../lib/openzeppelin-contracts/contracts/access/Ownable.sol";
  */
 contract MockToken is ERC20, Ownable {
 
-    constructor(string memory name, string memory symbol, uint256 initialSupply) ERC20(name, symbol) Ownable(msg.sender) {
-        _mint(msg.sender, initialSupply * 10 ** decimals());
+    constructor(string memory name, string memory symbol, uint8 decimals, uint256 initialSupply) ERC20(name, symbol) Ownable(msg.sender) {
+        _mint(msg.sender, initialSupply * (10 ** decimals));
     }
 
     /*
