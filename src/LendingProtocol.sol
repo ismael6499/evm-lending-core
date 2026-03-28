@@ -92,6 +92,17 @@ contract LendingProtocol is ReentrancyGuard, Pausable, Ownable {
         _;
     }
 
+    /**
+     * @notice Validates the signature's expiration and nonce.
+     * @param _sigData The signature metadata (nonce, deadline).
+     */
+    modifier onlyValidSignature(SignatureData calldata _sigData) {
+        if(_sigData.deadline < block.timestamp) revert SignatureExpired();
+        if(_sigData.nonce != userNonces[msg.sender]) revert InvalidNonce();
+        _;
+        userNonces[msg.sender]++;
+    }
+
     /// @notice Raised when an operation is attempted with an amount of zero.
     error InvalidAmount();
     /// @notice Raised when a liquidator attempts to repay more than the user's current borrow balance.
@@ -102,6 +113,12 @@ contract LendingProtocol is ReentrancyGuard, Pausable, Ownable {
     error NoCollateralToSeize();
     /// @notice Raised when the borrower doesn't have enough collateral in the selected token.
     error InsufficientCollateral();
+    /// @notice Raised when a signature has passed its deadline.
+    error SignatureExpired();
+    /// @notice Raised when a signature uses an incorrect or already used nonce.
+    error InvalidNonce();
+    /// @notice Raised when the cryptographic signature recovery does not match the expected signer.
+    error InvalidSignature();
 
     /**
      * @notice Represents the protocol state for an individual user.
@@ -224,6 +241,54 @@ contract LendingProtocol is ReentrancyGuard, Pausable, Ownable {
         emit Deposit(msg.sender, _token, _amount);
     }
 
+    /**
+     * @notice Deposits tokens into the protocol using a cryptographic signature for validation.
+     * @dev Follows the Checks-Effects-Interactions (CEI) pattern. Uses ECDSA for signature verification.
+     * @param _token The address of the token to deposit.
+     * @param _amount The amount of tokens to deposit.
+     * @param _sigData The signature and metadata (nonce, deadline).
+     */
+    function depositWithSignature(
+        address _token, 
+        uint256 _amount, 
+        SignatureData calldata _sigData
+    ) 
+        external 
+        nonReentrant 
+        whenNotPaused 
+        onlyActiveMarket(_token) 
+        onlyValidSignature(_sigData) 
+    {
+        if(_amount == 0) revert InvalidAmount();
+
+        // Verify signature
+        bytes32 messageHash = keccak256(abi.encodePacked(
+            "deposit",
+            _token,
+            _amount,
+            _sigData.nonce,
+            _sigData.deadline
+        ));
+        
+        bytes32 ethSignedMessageHash = MessageHashUtils.toEthSignedMessageHash(messageHash);
+        address signer = ethSignedMessageHash.recover(_sigData.signature);
+        if(signer != msg.sender) revert InvalidSignature();
+        if(signer == address(0)) revert InvalidSignature();
+
+        // --- Effects ---
+        userDeposits[msg.sender][_token] += _amount;
+        users[msg.sender].totalDeposited += _amount;
+        users[msg.sender].lastUpdateTime = block.timestamp;
+        users[msg.sender].isActive = true;
+
+        markets[_token].totalSupply += _amount;
+
+        emit Deposit(msg.sender, _token, _amount);
+
+        // --- Interactions ---
+        IERC20(_token).safeTransferFrom(msg.sender, address(this), _amount);
+    }
+
     function withdraw(address _token, uint256 _amount) external onlyActiveMarket(_token) nonReentrant whenNotPaused {
         require(_amount > 0, "Amount must be greater than 0");
         require(userDeposits[msg.sender][_token] >= _amount, "Insufficient deposit balance");
@@ -300,8 +365,6 @@ contract LendingProtocol is ReentrancyGuard, Pausable, Ownable {
         if(userDeposits[_user][collateralToken] < collateralToSeize) revert InsufficientCollateral();
         
         // --- Effects ---
-        IERC20(_token).safeTransferFrom(msg.sender, address(this), _amount);
-        
         userBorrows[_user][_token] -= _amount;
         users[_user].totalBorrowed -= _amount;
         markets[_token].totalBorrow -= _amount;
@@ -316,9 +379,10 @@ contract LendingProtocol is ReentrancyGuard, Pausable, Ownable {
             users[_user].isActive = false;
         }
 
-        
         // --- Interactions ---
+        IERC20(_token).safeTransferFrom(msg.sender, address(this), _amount);
         IERC20(collateralToken).safeTransfer(msg.sender, collateralToSeize);
+        
         emit Liquidate(msg.sender, _user, _token, _amount);
     }
 
