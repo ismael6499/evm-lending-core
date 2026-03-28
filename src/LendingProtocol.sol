@@ -92,6 +92,17 @@ contract LendingProtocol is ReentrancyGuard, Pausable, Ownable {
         _;
     }
 
+    /// @notice Raised when an operation is attempted with an amount of zero.
+    error InvalidAmount();
+    /// @notice Raised when a liquidator attempts to repay more than the user's current borrow balance.
+    error InsufficientBorrowToLiquidate();
+    /// @notice Raised when a liquidation is attempted on a healthy position (ratio >= threshold).
+    error PositionNotLiquidatable();
+    /// @notice Raised when no suitable collateral token can be found for the user.
+    error NoCollateralToSeize();
+    /// @notice Raised when the borrower doesn't have enough collateral in the selected token.
+    error InsufficientCollateral();
+
     /**
      * @notice Represents the protocol state for an individual user.
      * @dev State variables are tracked to calculate interest and health factor.
@@ -268,6 +279,81 @@ contract LendingProtocol is ReentrancyGuard, Pausable, Ownable {
         markets[_token].totalBorrow -= _amount;
 
         emit Repay(msg.sender, _token, _amount);
+    }
+
+    /**
+     * @notice Liquidates an unhealthy position by repaying debt and seizing collateral at a discount.
+     * @dev Follows the Checks-Effects-Interactions (CEI) pattern to prevent reentrancy and uses custom errors for gas efficiency.
+     * @param _user The address of the borrower whose position is being liquidated.
+     * @param _token The address of the borrowed token being repaid.
+     * @param _amount The amount of debt to repay.
+     */
+    function liquidate(address _user, address _token, uint256 _amount) external nonReentrant whenNotPaused onlyActiveMarket(_token) {
+        if(_amount == 0) revert InvalidAmount();
+        if(userBorrows[_user][_token] < _amount) revert InsufficientBorrowToLiquidate();
+        if(!isLiquidatable(_user)) revert PositionNotLiquidatable();
+        
+        uint256 collateralToSeize = (_amount * (BASIS_POINTS + LIQUIDATION_PENALTY)) / BASIS_POINTS;
+        
+        address collateralToken = findBestCollateral(_user);
+        if(collateralToken == address(0)) revert NoCollateralToSeize();
+        if(userDeposits[_user][collateralToken] < collateralToSeize) revert InsufficientCollateral();
+        
+        // --- Effects ---
+        IERC20(_token).safeTransferFrom(msg.sender, address(this), _amount);
+        
+        userBorrows[_user][_token] -= _amount;
+        users[_user].totalBorrowed -= _amount;
+        markets[_token].totalBorrow -= _amount;
+
+        userDeposits[_user][collateralToken] -= collateralToSeize;
+        users[_user].totalDeposited -= collateralToSeize;
+        markets[collateralToken].totalSupply -= collateralToSeize;
+        
+        users[_user].lastUpdateTime = block.timestamp;
+
+        if(users[_user].totalBorrowed == 0 && users[_user].totalDeposited == 0){
+            users[_user].isActive = false;
+        }
+
+        
+        // --- Interactions ---
+        IERC20(collateralToken).safeTransfer(msg.sender, collateralToSeize);
+        emit Liquidate(msg.sender, _user, _token, _amount);
+    }
+
+    /**
+     * @notice Checks if a user's position is below the liquidation threshold.
+     * @param _user The address to check.
+     * @return bool True if the position can be liquidated.
+     */
+    function isLiquidatable(address _user) public view returns (bool) {
+        uint256 ratio = getCollateralizationRatio(_user);
+        return ratio < LIQUIDATION_THRESHOLD;
+    }
+
+    /**
+     * @notice Searches for the best collateral token based on the highest adjusted collateral value.
+     * @dev Iterates through all markets to find the asset where the user has the most value (amount * factor).
+     * @param _user The address of the borrower.
+     * @return address The address of the token with the highest collateral value, or address(0) if none found.
+     */
+    function findBestCollateral(address _user) internal view returns (address) {
+        address bestToken = address(0);
+        uint256 bestValue = 0;
+        
+        uint256 length = supportedTokens.length;
+        for(uint256 i = 0; i < length; i++){
+            address token = supportedTokens[i];
+            if(markets[token].isActive && userDeposits[_user][token] > 0){
+                uint256 value = (userDeposits[_user][token] * markets[token].collateralFactor) / BASIS_POINTS;
+                if(value > bestValue){
+                    bestValue = value;
+                    bestToken = token;
+                }
+            }
+        }
+        return bestToken;
     }
 
     function canWithdraw(address _user, address _token, uint256 _amount) public view returns (bool) {
